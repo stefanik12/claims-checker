@@ -1,0 +1,5 @@
+We assign a pair of (paragraph, candidate_answer) a label of whether the candidate_answer is an answer to some question.
+Dataset similar to MRPC, thus we preprocess to MRPC format and reuse the preprocessing of it:
+
+https://github.com/huggingface/transformers/blob/master/examples/run_glue.py
+https://github.com/huggingface/transformers/tree/master/examples#glue
