@@ -16,14 +16,26 @@ def get_tokenizer_model(model_id: str):
     return tokenizer, model
 
 
+def get_wordpieces(text: str, tokenizer: PreTrainedTokenizer, is_single_kword: bool, 
+                   max_length: int = 512, as_tokens: bool = False, padding: bool = False):
+    if not is_single_kword:
+        out_ids = tokenizer.encode_plus(text, return_tensors='pt', add_special_tokens=True, max_length=max_length, 
+                                        truncation=True, padding=padding)
+    else:
+        out_ids = tokenizer.encode_plus(text, return_tensors='pt', add_special_tokens=False, padding=padding)
+    if not as_tokens:
+        return out_ids['input_ids']
+    else:
+        return tokenizer.convert_ids_to_tokens(out_ids["input_ids"].flatten().tolist())
+
+
 def get_attentions(text: str, model:BertModel, tokenizer: PreTrainedTokenizer):
     # overflow handling: to process everything, replace [text] with native text splitting 
     # we do not know, how to losslessly handle overflowing sentences! We need longer attention here
     # inputs = tokenizer.batch_encode_plus([text], return_tensors='pt', add_special_tokens=True, max_length=512, pad_to_max_length=True)
-    inputs = tokenizer.encode_plus(text, return_tensors='pt', add_special_tokens=True, max_length=512)
-    token_type_ids = inputs['token_type_ids']
-    input_ids = inputs['input_ids']
-    attention = model(input_ids, token_type_ids=token_type_ids)[-1]
+    input_ids = get_wordpieces(text, tokenizer, is_single_kword=False, as_tokens=False)
+#     inputs = tokenizer.encode_plus(text, return_tensors='pt', add_special_tokens=True, max_length=512)
+    attention = model(input_ids)[-1]
     wordpieces = tokenizer.convert_ids_to_tokens(input_ids.view(-1))
     return np.array(wordpieces), attention
 
@@ -32,7 +44,7 @@ def matching_len(seq: list, subseq: list):
     # match pairwise, to tolerate prefix bullshit given by GTP-2 tokenizer
     seq_postproc = [w.replace("Ġ", "").lower() for w in seq]
     subseq_postproc = [w.replace("Ġ", "").lower() for w in subseq]
-    return len(subseq) if seq_postproc == subseq_postproc else 0
+    return len(subseq) if seq_postproc[:len(subseq_postproc)] == subseq_postproc else 0
 
 
 def get_keyphrases_mask(wordpieces: str, keywds: list, tokenizer: PreTrainedTokenizer):
@@ -40,8 +52,9 @@ def get_keyphrases_mask(wordpieces: str, keywds: list, tokenizer: PreTrainedToke
 
     keywd_masks = []
     for keywd in keywds:
-        keywd_wpieces = tokenizer.convert_ids_to_tokens(tokenizer.encode_plus(keywd, add_special_tokens=False)["input_ids"])
-        keywd_item_lens = [matching_len(wordpieces[i:i+len(keywd_wpieces)], keywd_wpieces) for i, _ in enumerate(wordpieces)]
+        keywd_wpieces = get_wordpieces(keywd, tokenizer, is_single_kword=True, as_tokens=True)
+#         keywd_wpieces = tokenizer.convert_ids_to_tokens(tokenizer.encode_plus(keywd, add_special_tokens=False)["input_ids"])
+        keywd_item_lens = [matching_len(wordpieces[i:], keywd_wpieces) for i, _ in enumerate(wordpieces)]
         keywd_item_mask = np.zeros(len(wordpieces))
         for i, length in enumerate(keywd_item_lens):
             if i > 0:
