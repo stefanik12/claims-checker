@@ -26,7 +26,7 @@ class AWIRSystem(IRSystem):
     search_bar = None
 
     def __init__(self, transformer_name_or_path: str = "bert-base-uncased",
-                 device: str = "cuda", infer_device: str = "cuda"):
+                 device: str = "cuda", infer_device: str = "cpu"):
         # weight documents, index weighting and tokens by their embeddings, to use it then in search
         transformer = AutoTransformerModule(transformer_name_or_path, device=device)
         self.weighter = SelectedHeadsAttentionWeighting(transformer,
@@ -34,18 +34,20 @@ class AWIRSystem(IRSystem):
                                                         aggregation_strategy="per-layer-mean+sum")
         self.embeder = TransformerEmbedding(transformer, embed_strategy="last-4")
         self.inv_embedding_index = []
-        self.embedding_idx = []
+        embedding_idx = []
         self.doc_index = set()
-        for doc_id, doc in tqdm(list(load_documents(Document).items()), desc="Indexing"):
+        for doc_id, doc in tqdm(list(load_documents(Document).items())[:10], desc="Indexing"):
             tokens_a, weights = self.weighter.tokenize_weight_text(doc.body)
             tokens_e, embeddings = self.embeder.tokenize_embed_text(doc.body)
             assert len(tokens_a) == len(tokens_e)
 
             for token, embedding, weight in zip(tokens_a, embeddings, weights):
-                self.embedding_idx.append(torch.tensor(embedding, dtype=torch.float32))
+                embedding_idx.append(torch.tensor(embedding, dtype=torch.float32))
                 self.inv_embedding_index.append((weight, token, doc_id))
                 self.doc_index.add(doc_id)
-        self.embedding_idx = torch.stack(self.embedding_idx, dim=0).to(infer_device)
+        self.embedding_idx = torch.stack(embedding_idx, dim=0).to(infer_device)
+        norms = torch.linalg.norm(self.embedding_idx, dim=1, ord=2).unsqueeze(-1)
+        self.embedding_idx = self.embedding_idx / torch.max(norms, 1e-8 * torch.ones_like(norms))
 
     def search(self, query: QueryBase, weight_query: bool = False) -> List[str]:
         """The ranked retrieval results for a query.
@@ -74,9 +76,12 @@ class AWIRSystem(IRSystem):
 
         cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
 
-        for token, embedding in zip(*self.embeder.tokenize_embed_text(query.body)):
-            embedding = torch.tensor(embedding, dtype=torch.float32).to(self.embedding_idx.device).unsqueeze(0)
-            distances = cos(embedding, self.embedding_idx)
+        for token, embedding_l in zip(*self.embeder.tokenize_embed_text(query.body)):
+            embedding = torch.tensor(embedding_l, dtype=torch.float32).to(self.embedding_idx.device)
+            norm = torch.linalg.norm(embedding, ord=2)
+            embedding_norm = embedding / torch.max(norm, 1e-10 * torch.ones_like(norm))
+
+            distances = torch.matmul(self.embedding_idx, embedding_norm)
             for dist, idx in zip(*torch.sort(distances)):
                 attention, match_token, match_doc_id = self.inv_embedding_index[idx.item()]
                 matches.append(Match(match_doc_id, match_token, dist.item(), attention))
