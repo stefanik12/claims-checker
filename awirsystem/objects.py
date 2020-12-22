@@ -1,6 +1,8 @@
 from pv211_utils.entities import QueryBase
 from pv211_utils.entities import DocumentBase
 
+import config
+
 
 class Document(DocumentBase):
     """
@@ -44,8 +46,14 @@ class Query(QueryBase):
 
 class Match:
 
-    def __init__(self, doc_id,  token: str, embedding_dist: float, weight: float):
+    def __init__(self, doc_id,  token: str, embedding_dist: float, attention: float):
         self.doc_id = doc_id
         self.token = token
         self.embedding_dist = embedding_dist
-        self.weight = weight
+        self.attention = attention
+        self.weight = self._eval_match()
+
+    def _eval_match(self) -> float:
+        return ((self.attention * config.weight_embedding_ratio) + self.embedding_dist) / \
+               (config.weight_embedding_ratio + 1)
+

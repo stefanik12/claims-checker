@@ -1,13 +1,18 @@
 from typing import Tuple, List
+
+from pv211_utils.entities import QueryBase
 from scipy.spatial import distance
 import numpy as np
 
 from pv211_utils.irsystem import IRSystem
 from pv211_utils.loader import load_documents
+from tqdm import tqdm
+import torch
 
+import config
 from embedding import TransformerEmbedding
 from nn_wrappers import AutoTransformerModule
-from objects import Document
+from objects import Document, Match
 from weighting import SelectedHeadsAttentionWeighting
 
 
@@ -18,66 +23,77 @@ class AWIRSystem(IRSystem):
         2.1 Match candidate documents by contextual embeddings of doc tokens to query tokens
         2.2 Rank the candidate documents by the attention weight of their matching parts
     """
+    search_bar = None
 
-    def __init__(self, transformer_name_or_path: str = "bert-base-uncased"):
+    def __init__(self, transformer_name_or_path: str = "bert-base-uncased",
+                 device: str = "cuda", infer_device: str = "cuda"):
         # weight documents, index weighting and tokens by their embeddings, to use it then in search
-        transformer = AutoTransformerModule(transformer_name_or_path)
+        transformer = AutoTransformerModule(transformer_name_or_path, device=device)
         self.weighter = SelectedHeadsAttentionWeighting(transformer,
                                                         heads_subset=self._subset_heads(),
                                                         aggregation_strategy="per-layer-mean+sum")
         self.embeder = TransformerEmbedding(transformer, embed_strategy="last-4")
-        self.inv_embedding_index = dict()
+        self.inv_embedding_index = []
+        self.embedding_idx = []
         self.doc_index = set()
-        for doc_id, doc in load_documents(Document):
+        for doc_id, doc in tqdm(list(load_documents(Document).items()), desc="Indexing"):
             tokens_a, weights = self.weighter.tokenize_weight_text(doc.body)
             tokens_e, embeddings = self.embeder.tokenize_embed_text(doc.body)
             assert len(tokens_a) == len(tokens_e)
 
             for token, embedding, weight in zip(tokens_a, embeddings, weights):
-                self.inv_embedding_index[embedding] = (weight, token, doc_id)
+                self.embedding_idx.append(torch.tensor(embedding, dtype=torch.float32))
+                self.inv_embedding_index.append((weight, token, doc_id))
                 self.doc_index.add(doc_id)
+        self.embedding_idx = torch.stack(self.embedding_idx, dim=0).to(infer_device)
 
-    def _eval_match(self, matches: List[Tuple[int, str]], weight_embedding_ratio: float) -> float:
-        return 0
-
-    def search(self, query: str, weight_query: bool = False, distance_f: str = "cosine",
-               match_topn: int = 10, retrieve_topn: int = 10, weight_embedding_ratio: float = 1.0) -> List[str]:
+    def search(self, query: QueryBase, weight_query: bool = False) -> List[str]:
         """The ranked retrieval results for a query.
 
         Parameters
         ----------
             :param query : input query
-            :param weight_query: Whether to weight matches of query tokens by their inner weights
+            :param weight_query: Whether to weight matches of query tokens by their inner attention weights
             :param distance_f:
             :param match_topn:
             :param retrieve_topn:
-            :param weight_embedding_ratio:
 
         Returns
         -------
         list of Document
             The ranked retrieval results for a query.
         """
-        embedding_idx = np.ndarray(self.inv_embedding_index.keys())
-        if match_topn is None or not match_topn:
-            match_topn = len(embedding_idx)
+        if self.search_bar is None:
+            self.search_bar = tqdm(total=225)
+        # print("Searching: %s" % query.body)
 
-        docs_scores = {doc_id: [] for doc_id in self.doc_index}
+        if config.embedding_matches is None or not config.embedding_matches:
+            config.embedding_matches = len(self.embedding_idx)
 
-        for token, embedding in self.embeder.tokenize_embed_text(query):
-            distances = distance.cdist(np.array([embedding]), embedding_idx, distance_f)[0]
-            dist_e_rank = sorted(list(zip(distances, embedding_idx)), key=lambda d_e: d_e[0])
-            for dist, response_token_e in dist_e_rank[:match_topn]:
-                match_weight, match_token, match_doc_id = self.inv_embedding_index[response_token_e]
-                docs_scores[match_doc_id].append((match_weight, match_token))
-        # TODO: aggregate per-document scores by selected strategy
-        # TODO: we are minimizing weights, but maximizing rank
-        docs_ranked = sorted(docs_scores.items(), key=lambda docid_docm: self._eval_match(docid_docm[1],
-                                                                                          weight_embedding_ratio))
-        print(docs_ranked)
-        docs_returned = [doc_id for doc_id, doc_score in docs_ranked[:retrieve_topn]]
+        matches = []
 
-        return docs_returned
+        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+
+        for token, embedding in zip(*self.embeder.tokenize_embed_text(query.body)):
+            embedding = torch.tensor(embedding, dtype=torch.float32).to(self.embedding_idx.device).unsqueeze(0)
+            distances = cos(embedding, self.embedding_idx)
+            for dist, idx in zip(*torch.sort(distances)):
+                attention, match_token, match_doc_id = self.inv_embedding_index[idx.item()]
+                matches.append(Match(match_doc_id, match_token, dist.item(), attention))
+
+        # done: aggregate per-document scores by selected)strategy
+        # done: we are minimizing weights, but maximizing rank
+        # TODO: all attention weights are the same, find out why
+        # TODO: also check embeddings, all distances are the same now
+
+        docs_matches = dict()
+        for match in sorted(matches, key=lambda m: m.weight):
+            if len(docs_matches) < config.retrieve_matches and match.doc_id not in docs_matches:
+                docs_matches[match.doc_id] = match
+
+        self.search_bar.update(1)
+
+        return [str(k) for k in docs_matches.keys()]
 
     def _subset_heads(self) -> List[Tuple[int, int]]:
         from heads_idx import best_to_worst_heads

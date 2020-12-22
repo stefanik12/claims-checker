@@ -2,7 +2,10 @@ import abc
 import torch
 from typing import List, Tuple
 
-from nn_wrappers import PreTrainedAttentionWrapper, AutoTransformerModule
+from transformers import BatchEncoding
+
+from common import TransformerBase
+from nn_wrappers import AutoTransformerModule
 
 
 class Weighting(abc.ABC):
@@ -22,33 +25,25 @@ class Weighting(abc.ABC):
         raise NotImplemented()
 
 
-class AttentionWeighting(Weighting, abc.ABC):
+class AttentionWeighting(TransformerBase, Weighting, abc.ABC):
 
-    wrapper = None
+    def __init__(self, module: AutoTransformerModule):
+        super().__init__(module)
 
-    def __init__(self, attention_module: AutoTransformerModule):
-        self.wrapper = PreTrainedAttentionWrapper(attention_module)
-
-    def _get_inputs(self, text: str) -> torch.Tensor:
-        return self.wrapper.module.tokenizer.encode_plus(text, return_tensors='pt')
-
-    def _tokenize_inputs(self, inputs: torch.Tensor):
-        return self.wrapper.module.tokenizer.convert_ids_to_tokens(inputs["input_ids"].flatten().tolist())
-
-    def tokenize_text(self, text: str) -> List[str]:
-        inputs = self._get_inputs(text)
-        return self._tokenize_inputs(inputs)
-
-    def tokenize_weight_text(self, text: str) -> Tuple[List[str], List[float]]:
+    def tokenize_weight_text(self, text: str, get_special_tokens: bool = False) -> Tuple[List[str], List[float]]:
         inputs = self._get_inputs(text)
         tokenized = self._tokenize_inputs(inputs)
-        weights = self.weight_inputs(inputs)
-        assert len(tokenized) == len(weights)
+        weights = self.weight_inputs(inputs)[0]
 
+        if not get_special_tokens:
+            tokenized = self.drop_special_tokens(inputs, tokenized)
+            weights = self.drop_special_tokens(inputs, weights)
+
+        assert len(tokenized) == len(weights)
         return tokenized, weights
 
     @abc.abstractmethod
-    def weight_inputs(self, inputs: torch.Tensor) -> List[float]:
+    def weight_inputs(self, inputs: BatchEncoding) -> List[List[float]]:
         raise NotImplemented()
 
 
@@ -62,8 +57,9 @@ class SelectedHeadsAttentionWeighting(AttentionWeighting):
         self.heads = heads_subset
         self.agg_strategy = aggregation_strategy
 
-    def weight_inputs(self, inputs: torch.Tensor) -> List[float]:
-        all_attentions = self.wrapper.module(inputs)
+    def weight_inputs(self, inputs: BatchEncoding) -> List[float]:
+        device = self.transformer.model.device
+        all_attentions = self.transformer.model(**inputs.to(device), output_attentions=True)[-1]
         weights = self._aggregate_attentions(all_attentions, self.heads, self.agg_strategy)
         return weights.detach().cpu().numpy().tolist()
 
@@ -82,19 +78,22 @@ class SelectedHeadsAttentionWeighting(AttentionWeighting):
             per_layer_heads = {l: [h for l_i, h in heads if l == l_i] for l in layers}
             per_layer_strategy = "mean" if "mean" in strategy.split("+")[0] else "sum"
             per_layer_aggs = dict()
-            for l_i, l_heads in per_layer_heads:
+            for l_i, l_heads in per_layer_heads.items():
                 per_layer_aggs[l_i] = self._aggregate_attentions(attentions,
                                                                  heads=[(l_i, lhead) for lhead in l_heads],
                                                                  strategy=per_layer_strategy)
-            heads_cat = torch.cat(list(per_layer_aggs.values()), dim=-1)
-            out_strategy = "mean" if "mean" in strategy.split("+")[1] else "sum"
+            heads_cat = torch.cat(list(per_layer_aggs.values()), dim=0) .unsqueeze(0)
             # from here, we get the same format as when concatenating all the heads directly
+            out_strategy = "mean" if "mean" in strategy.split("+")[1] else "sum"
         else:
-            heads_cat = torch.cat([attentions[l_i, h_i] for l_i, h_i in heads], dim=-1)
+            heads_cat = torch.cat([attentions[l_i][:, h_i] for l_i, h_i in heads], dim=0)
             out_strategy = strategy
         if out_strategy == "sum":
-            return heads_cat.sum(dim=-1)
+            return heads_cat.sum(dim=-2)
         elif out_strategy == "mean":
-            return heads_cat.mean(dim=-1)
+            return heads_cat.mean(dim=-2)
         else:
             raise ValueError("unknown strategy: %s " % out_strategy)
+
+
+
