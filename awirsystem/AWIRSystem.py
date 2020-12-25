@@ -26,7 +26,7 @@ class AWIRSystem(IRSystem):
     search_bar = None
 
     def __init__(self, transformer_name_or_path: str = "bert-base-uncased",
-                 device: str = "cuda", infer_device: str = "cpu"):
+                 device: str = "cuda", infer_device: str = "cuda"):
         # weight documents, index weighting and tokens by their embeddings, to use it then in search
         transformer = AutoTransformerModule(transformer_name_or_path, device=device)
         self.weighter = SelectedHeadsAttentionWeighting(transformer,
@@ -36,7 +36,7 @@ class AWIRSystem(IRSystem):
         self.inv_embedding_index = []
         embedding_idx = []
         self.doc_index = set()
-        for doc_id, doc in tqdm(list(load_documents(Document).items())[:10], desc="Indexing"):
+        for doc_id, doc in tqdm(list(load_documents(Document).items()), desc="Indexing"):
             tokens_a, weights = self.weighter.tokenize_weight_text(doc.body)
             tokens_e, embeddings = self.embeder.tokenize_embed_text(doc.body)
             assert len(tokens_a) == len(tokens_e)
@@ -82,14 +82,17 @@ class AWIRSystem(IRSystem):
             embedding_norm = embedding / torch.max(norm, 1e-10 * torch.ones_like(norm))
 
             distances = torch.matmul(self.embedding_idx, embedding_norm)
-            for dist, idx in zip(*torch.sort(distances)):
+            for dist, idx in zip(*torch.sort(distances, descending=True)):
                 attention, match_token, match_doc_id = self.inv_embedding_index[idx.item()]
                 matches.append(Match(match_doc_id, match_token, dist.item(), attention))
 
         # done: aggregate per-document scores by selected)strategy
         # done: we are minimizing weights, but maximizing rank
-        # TODO: all attention weights are the same, find out why
-        # TODO: also check embeddings, all distances are the same now
+        # done: all attention weights are the same, find out why
+        # done: also check embeddings, all distances are the same now
+        # debug:
+        # docs = load_documents(Document)
+        # [(m.weight, docs[m.doc_id]) for m in sorted(matches, key=lambda m: m.weight, reverse=True)]
 
         docs_matches = dict()
         for match in sorted(matches, key=lambda m: m.weight):
