@@ -51,16 +51,22 @@ class SelectedHeadsAttentionWeighting(AttentionWeighting):
 
     def __init__(self, attention_module: AutoTransformerModule,
                  heads_subset: List[Tuple[int, int]],
-                 aggregation_strategy: str):
+                 aggregation_strategy: str,
+                 normalize_weights: bool = True):
         super().__init__(attention_module)
 
         self.heads = heads_subset
         self.agg_strategy = aggregation_strategy
+        self.normalize_weights = normalize_weights
 
     def weight_inputs(self, inputs: BatchEncoding) -> List[float]:
         device = self.transformer.model.device
         all_attentions = self.transformer.model(**inputs.to(device), output_attentions=True)[-1]
-        weights = self._aggregate_attentions(all_attentions, self.heads, self.agg_strategy)
+        weights = self._aggregate_attentions(all_attentions, self.heads, self.agg_strategy).detach().cpu()
+        if self.normalize_weights:
+            norm = torch.linalg.norm(weights, ord=2)
+            weights = torch.tensor(weights) / torch.max(norm, 1e-10 * torch.ones_like(norm))
+
         return weights.detach().cpu().numpy().tolist()
 
     def _aggregate_attentions(self, attentions: torch.Tensor,

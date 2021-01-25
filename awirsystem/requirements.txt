@@ -1,1 +1,3 @@
 git+https://gitlab.fi.muni.cz/xstefan3/pv211-utils.git@master
+torch
+transformers

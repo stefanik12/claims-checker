@@ -1,8 +1,6 @@
 from typing import Tuple, List
 
 from pv211_utils.entities import QueryBase
-from scipy.spatial import distance
-import numpy as np
 
 from pv211_utils.irsystem import IRSystem
 from pv211_utils.loader import load_documents
@@ -26,17 +24,19 @@ class AWIRSystem(IRSystem):
     search_bar = None
 
     def __init__(self, transformer_name_or_path: str = "bert-base-uncased",
-                 device: str = "cuda", infer_device: str = "cuda"):
+                 weighting_device: str = "cpu", infer_device: str = "cpu",
+                 firstn_heads=None, aggregation_strategy="per-layer-mean+sum"):
         # weight documents, index weighting and tokens by their embeddings, to use it then in search
-        transformer = AutoTransformerModule(transformer_name_or_path, device=device)
+        transformer = AutoTransformerModule(transformer_name_or_path, device=weighting_device)
         self.weighter = SelectedHeadsAttentionWeighting(transformer,
-                                                        heads_subset=self._subset_heads(),
-                                                        aggregation_strategy="per-layer-mean+sum")
+                                                        heads_subset=self._subset_heads(firstn_heads),
+                                                        aggregation_strategy=aggregation_strategy)
         self.embeder = TransformerEmbedding(transformer, embed_strategy="last-4")
         self.inv_embedding_index = []
         embedding_idx = []
         self.doc_index = set()
-        for doc_id, doc in tqdm(list(load_documents(Document).items()), desc="Indexing"):
+        self.documents = load_documents(Document)
+        for doc_id, doc in tqdm(list(self.documents.items()), desc="Indexing"):
             tokens_a, weights = self.weighter.tokenize_weight_text(doc.body)
             tokens_e, embeddings = self.embeder.tokenize_embed_text(doc.body)
             assert len(tokens_a) == len(tokens_e)
@@ -49,16 +49,13 @@ class AWIRSystem(IRSystem):
         norms = torch.linalg.norm(self.embedding_idx, dim=1, ord=2).unsqueeze(-1)
         self.embedding_idx = self.embedding_idx / torch.max(norms, 1e-8 * torch.ones_like(norms))
 
-    def search(self, query: QueryBase, weight_query: bool = False) -> List[str]:
+    def search(self, query: QueryBase, weight_query: bool = False) -> List[Document]:
         """The ranked retrieval results for a query.
 
         Parameters
         ----------
             :param query : input query
             :param weight_query: Whether to weight matches of query tokens by their inner attention weights
-            :param distance_f:
-            :param match_topn:
-            :param retrieve_topn:
 
         Returns
         -------
@@ -74,35 +71,45 @@ class AWIRSystem(IRSystem):
 
         matches = []
 
-        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        q_tokens, q_embeddings = self.embeder.tokenize_embed_text(query.body)
+        q_tokens_w, q_weights = self.weighter.tokenize_weight_text(query.body)
+        assert q_tokens == q_tokens_w
 
-        for token, embedding_l in zip(*self.embeder.tokenize_embed_text(query.body)):
-            embedding = torch.tensor(embedding_l, dtype=torch.float32).to(self.embedding_idx.device)
-            norm = torch.linalg.norm(embedding, ord=2)
-            embedding_norm = embedding / torch.max(norm, 1e-10 * torch.ones_like(norm))
+        norm = torch.linalg.norm(torch.tensor(q_embeddings), ord=2)
+        q_embeddings_norm = torch.tensor(q_embeddings) / torch.max(norm, 1e-10 * torch.ones_like(norm))
+        
+        # similarity of query token tq to indexed token ti is tq_emb * ti_emb * ti_weight.T
+        # ti_weight is contextualized attention of indexed token, using attention heads by selected methodology,
+        # aggregated by selected methodology
+        e_sims = torch.matmul(self.embedding_idx, q_embeddings_norm.T.to(self.embedding_idx.device))
+        if weight_query:
+            w_e_sims = e_sims * torch.tensor(q_weights, device=e_sims.device).expand_as(e_sims)
+        else:
+            w_e_sims = e_sims
+            
+        sims_sorted, idxs_sorted = torch.topk(w_e_sims, k=config.embedding_matches, largest=True, sorted=True, dim=0)
 
-            distances = torch.matmul(self.embedding_idx, embedding_norm)
-            for dist, idx in zip(*torch.sort(distances, descending=True)):
-                attention, match_token, match_doc_id = self.inv_embedding_index[idx.item()]
-                matches.append(Match(match_doc_id, match_token, dist.item(), attention))
+        for q_idx, q_token in enumerate(q_tokens):
+            q_token_sims = sims_sorted[:, q_idx]
+            q_token_idx = idxs_sorted[:, q_idx]
+            for sim, (attention, match_token, match_doc_id) in zip(q_token_sims, [self.inv_embedding_index[idx]
+                                                                                  for idx in q_token_idx]):
+                matches.append(Match(match_doc_id, match_token, sim.item(), attention))
 
-        # done: aggregate per-document scores by selected)strategy
-        # done: we are minimizing weights, but maximizing rank
-        # done: all attention weights are the same, find out why
-        # done: also check embeddings, all distances are the same now
-        # debug:
-        # docs = load_documents(Document)
-        # [(m.weight, docs[m.doc_id]) for m in sorted(matches, key=lambda m: m.weight, reverse=True)]
+        docs_matches = {k: 0 for k in set([m.doc_id for m in matches])}
+        for match in matches:
+            docs_matches[match.doc_id] += match.weight
 
-        docs_matches = dict()
-        for match in sorted(matches, key=lambda m: m.weight):
-            if len(docs_matches) < config.retrieve_matches and match.doc_id not in docs_matches:
-                docs_matches[match.doc_id] = match
+        top_docs = [doc_id for doc_id in sorted(list(docs_matches.keys()), key=lambda k: docs_matches[k], reverse=True)]
 
         self.search_bar.update(1)
 
-        return [str(k) for k in docs_matches.keys()]
+        return [self.documents[k] for k in top_docs[:config.retrieve_matches]]
 
-    def _subset_heads(self) -> List[Tuple[int, int]]:
+    @staticmethod
+    def _subset_heads(firstn_heads: int = None) -> List[Tuple[int, int]]:
         from heads_idx import best_to_worst_heads
-        return best_to_worst_heads
+        if firstn_heads is None:
+            firstn_heads = len(best_to_worst_heads)
+        print("Using top %s heads" % firstn_heads)
+        return best_to_worst_heads[:firstn_heads]

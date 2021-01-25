@@ -45,7 +45,7 @@ class TransformerEmbedding(TransformerBase, Embedding):
         if "last" in self.embed_strategy:
             try:
                 how_many = int(self.embed_strategy.split("-")[-1])
-                return torch.cat([hidden_states[i] for i in range(-how_many, 0)], -1)
+                return torch.cat([hidden_states[i].detach().cpu() for i in range(-how_many, 0)], -1)
             except (IndexError, ValueError):
                 ValueError("Invalid embed_strategy: %s" % self.embed_strategy)
         else:
